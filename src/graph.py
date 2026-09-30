@@ -16,18 +16,13 @@ load_dotenv()
 
 
 def get_config(key):
-    """
-    Get configuration from environment variables first.
-    If running on Streamlit Cloud, use Streamlit secrets.
-    """
-
     value = os.getenv(key)
 
     if value:
         return value
 
     try:
-        return st.secrets.get(key)
+        return st.secrets[key]
     except Exception:
         return None
 
@@ -38,8 +33,16 @@ GEMINI_API_KEY = get_config("GEMINI_API_KEY")
 
 
 # =========================================================
-# GEMINI CLIENT
+# CLIENTS
 # =========================================================
+
+pc = Pinecone(
+    api_key=PINECONE_API_KEY
+)
+
+index = pc.Index(
+    PINECONE_INDEX_NAME
+)
 
 client = genai.Client(
     api_key=GEMINI_API_KEY
@@ -58,70 +61,186 @@ class AgentState(TypedDict):
 
 
 # =========================================================
-# RETRIEVAL NODE
+# RETRIEVAL
 # =========================================================
 
 def retrieve(state: AgentState):
 
-    pc = Pinecone(
-        api_key=PINECONE_API_KEY
-    )
+    question = state["question"]
 
-    index = pc.Index(
-        PINECONE_INDEX_NAME
-    )
+    try:
 
-    # Search Pinecone using the question
-    results = index.search(
-        namespace="agentic-ai",
-        query={
-            "inputs": {
-                "text": state["question"]
-            },
-            "top_k": 5
-        }
-    )
+        results = index.search(
+            namespace="agentic-ai",
+            query={
+                "inputs": {
+                    "text": question
+                },
+                "top_k": 5
+            }
+        )
 
-    contexts = []
+        contexts = []
 
-    # Extract retrieved chunks
-    for result in results["result"]["hits"]:
+        # -------------------------------------------------
+        # Get hits safely
+        # -------------------------------------------------
 
-        text = result["fields"].get(
-            "text",
-            ""
-        ).strip()
+        if isinstance(results, dict):
 
-        if text:
+            result_data = results.get(
+                "result",
+                {}
+            )
 
-            contexts.append({
-                "text": text,
+            hits = result_data.get(
+                "hits",
+                []
+            )
 
-                "source": result["fields"].get(
-                    "source",
-                    ""
-                ),
+        else:
 
-                "page": result["fields"].get(
-                    "page",
-                    0
-                ),
+            result_data = getattr(
+                results,
+                "result",
+                None
+            )
 
-                "score": float(
-                    result.get(
-                        "_score",
-                        0
-                    )
+            if result_data is not None:
+
+                hits = getattr(
+                    result_data,
+                    "hits",
+                    []
                 )
-            })
 
-    return {
-        "context": contexts
-    }
+            else:
+
+                hits = []
+
+        # -------------------------------------------------
+        # Process retrieved chunks
+        # -------------------------------------------------
+
+        for hit in hits:
+
+            if isinstance(hit, dict):
+
+                fields = hit.get(
+                    "fields",
+                    {}
+                )
+
+                score = hit.get(
+                    "_score",
+                    0
+                )
+
+            else:
+
+                fields = getattr(
+                    hit,
+                    "fields",
+                    {}
+                )
+
+                score = getattr(
+                    hit,
+                    "_score",
+                    0
+                )
+
+            # Make fields dictionary if necessary
+            if not isinstance(fields, dict):
+
+                try:
+                    fields = dict(fields)
+                except Exception:
+                    fields = {}
+
+            text = str(
+                fields.get(
+                    "text",
+                    ""
+                )
+            ).strip()
+
+            if text:
+
+                contexts.append({
+                    "text": text,
+
+                    "source": str(
+                        fields.get(
+                            "source",
+                            ""
+                        )
+                    ),
+
+                    "page": fields.get(
+                        "page",
+                        0
+                    ),
+
+                    "score": float(
+                        score
+                    )
+                })
+
+        # -------------------------------------------------
+        # DEBUG INFORMATION
+        # -------------------------------------------------
+
+        print(
+            "QUESTION:",
+            question
+        )
+
+        print(
+            "NUMBER OF HITS:",
+            len(hits)
+        )
+
+        print(
+            "NUMBER OF CONTEXTS:",
+            len(contexts)
+        )
+
+        if contexts:
+
+            print(
+                "BEST SCORE:",
+                max(
+                    item["score"]
+                    for item in contexts
+                )
+            )
+
+        return {
+            "context": contexts
+        }
+
+    except Exception as e:
+
+        print(
+            "================ PINECONE ERROR ================"
+        )
+
+        print(
+            repr(e)
+        )
+
+        print(
+            "================================================="
+        )
+
+        return {
+            "context": []
+        }
 
 
 # =========================================================
-# GENERATION NODE
+# GENERATION
 # =========================================================
 
 def generate(state: AgentState):
@@ -132,13 +251,12 @@ def generate(state: AgentState):
     )
 
     # -----------------------------------------------------
-    # No retrieved context
+    # No context
     # -----------------------------------------------------
 
     if not context:
 
         return {
-            "context": [],
             "answer": (
                 "I could not find this information in the "
                 "Agentic AI document."
@@ -147,22 +265,21 @@ def generate(state: AgentState):
         }
 
     # -----------------------------------------------------
-    # Find highest retrieval score
+    # Best score
     # -----------------------------------------------------
 
     best_score = max(
-        float(item.get("score", 0))
+        float(item["score"])
         for item in context
     )
 
     # -----------------------------------------------------
-    # Reject unrelated questions
+    # Minimum relevance
     # -----------------------------------------------------
 
     if best_score < 0.45:
 
         return {
-            "context": [],
             "answer": (
                 "I could not find this information in the "
                 "Agentic AI document."
@@ -171,7 +288,7 @@ def generate(state: AgentState):
         }
 
     # -----------------------------------------------------
-    # Prepare retrieved context
+    # Prepare context
     # -----------------------------------------------------
 
     context_text = "\n\n".join(
@@ -181,7 +298,7 @@ def generate(state: AgentState):
     )
 
     # -----------------------------------------------------
-    # Grounded RAG prompt
+    # Prompt
     # -----------------------------------------------------
 
     prompt = f"""
@@ -194,23 +311,13 @@ STRICT RULES:
 
 1. Use only the retrieved document content.
 2. Do not use outside knowledge.
-3. Do not invent or assume information.
-4. Answer the exact question asked.
-5. Summarize the information in your own words.
-6. Do not copy the PDF text word-for-word.
-7. Keep the answer clear, natural, and concise.
-8. If there are multiple points, use bullet points.
-9. If the question asks for a definition, give a definition.
-10. If the question asks for benefits, give only benefits
-    supported by the document.
-11. If the question asks for capabilities, give only
-    capabilities supported by the document.
-12. If the question asks for challenges, give only
-    challenges supported by the document.
-13. If the question asks for a comparison, compare only
-    information supported by the document.
-14. If the answer is not available in the retrieved
-    document content, respond exactly with:
+3. Do not invent information.
+4. Answer the exact question.
+5. Summarize in your own words.
+6. Keep the answer clear and concise.
+7. Use bullet points when appropriate.
+8. If the information is not available in the
+   retrieved content, say:
 
 "I could not find this information in the Agentic AI document."
 
@@ -222,11 +329,11 @@ USER QUESTION:
 
 {state["question"]}
 
-Give only the final answer to the user's question.
+Give only the final answer.
 """
 
     # -----------------------------------------------------
-    # Gemini generation
+    # Gemini
     # -----------------------------------------------------
 
     try:
@@ -248,7 +355,7 @@ Give only the final answer to the user's question.
     except Exception as e:
 
         print(
-            "\n================ GEMINI ERROR ================"
+            "================ GEMINI ERROR ================"
         )
 
         print(
@@ -256,12 +363,8 @@ Give only the final answer to the user's question.
         )
 
         print(
-            "================================================\n"
+            "================================================"
         )
-
-    # -----------------------------------------------------
-    # Gemini unavailable
-    # -----------------------------------------------------
 
     return {
         "answer": (
@@ -273,15 +376,12 @@ Give only the final answer to the user's question.
 
 
 # =========================================================
-# LANGGRAPH WORKFLOW
+# LANGGRAPH
 # =========================================================
 
 graph_builder = StateGraph(
     AgentState
 )
-
-
-# Add nodes
 
 graph_builder.add_node(
     "retrieve",
@@ -293,31 +393,19 @@ graph_builder.add_node(
     generate
 )
 
-
-# START → RETRIEVE
-
 graph_builder.add_edge(
     START,
     "retrieve"
 )
-
-
-# RETRIEVE → GENERATE
 
 graph_builder.add_edge(
     "retrieve",
     "generate"
 )
 
-
-# GENERATE → END
-
 graph_builder.add_edge(
     "generate",
     END
 )
-
-
-# Compile LangGraph
 
 graph = graph_builder.compile()

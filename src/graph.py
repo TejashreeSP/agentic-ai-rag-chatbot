@@ -1,6 +1,7 @@
 from typing import TypedDict
 import os
 
+import streamlit as st
 from langgraph.graph import StateGraph, START, END
 from pinecone import Pinecone
 from dotenv import load_dotenv
@@ -13,11 +14,36 @@ from google import genai
 
 load_dotenv()
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+def get_config(key):
+    """
+    Get configuration from environment variables first.
+    If running on Streamlit Cloud, use Streamlit secrets.
+    """
+
+    value = os.getenv(key)
+
+    if value:
+        return value
+
+    try:
+        return st.secrets.get(key)
+    except Exception:
+        return None
+
+
+PINECONE_API_KEY = get_config("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = get_config("PINECONE_INDEX_NAME")
+GEMINI_API_KEY = get_config("GEMINI_API_KEY")
+
+
+# =========================================================
+# GEMINI CLIENT
+# =========================================================
+
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 
 # =========================================================
@@ -37,9 +63,15 @@ class AgentState(TypedDict):
 
 def retrieve(state: AgentState):
 
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    index = pc.Index(PINECONE_INDEX_NAME)
+    pc = Pinecone(
+        api_key=PINECONE_API_KEY
+    )
 
+    index = pc.Index(
+        PINECONE_INDEX_NAME
+    )
+
+    # Search Pinecone using the question
     results = index.search(
         namespace="agentic-ai",
         query={
@@ -52,16 +84,35 @@ def retrieve(state: AgentState):
 
     contexts = []
 
+    # Extract retrieved chunks
     for result in results["result"]["hits"]:
 
-        text = result["fields"].get("text", "").strip()
+        text = result["fields"].get(
+            "text",
+            ""
+        ).strip()
 
         if text:
+
             contexts.append({
                 "text": text,
-                "source": result["fields"].get("source", ""),
-                "page": result["fields"].get("page", 0),
-                "score": float(result.get("_score", 0))
+
+                "source": result["fields"].get(
+                    "source",
+                    ""
+                ),
+
+                "page": result["fields"].get(
+                    "page",
+                    0
+                ),
+
+                "score": float(
+                    result.get(
+                        "_score",
+                        0
+                    )
+                )
             })
 
     return {
@@ -75,10 +126,17 @@ def retrieve(state: AgentState):
 
 def generate(state: AgentState):
 
-    context = state.get("context", [])
+    context = state.get(
+        "context",
+        []
+    )
 
-    # No retrieved information
+    # -----------------------------------------------------
+    # No retrieved context
+    # -----------------------------------------------------
+
     if not context:
+
         return {
             "context": [],
             "answer": (
@@ -88,14 +146,21 @@ def generate(state: AgentState):
             "score": 0.0
         }
 
-    # Highest retrieval score
+    # -----------------------------------------------------
+    # Find highest retrieval score
+    # -----------------------------------------------------
+
     best_score = max(
         float(item.get("score", 0))
         for item in context
     )
 
+    # -----------------------------------------------------
     # Reject unrelated questions
+    # -----------------------------------------------------
+
     if best_score < 0.45:
+
         return {
             "context": [],
             "answer": (
@@ -105,14 +170,20 @@ def generate(state: AgentState):
             "score": best_score
         }
 
-    # Prepare retrieved document content
+    # -----------------------------------------------------
+    # Prepare retrieved context
+    # -----------------------------------------------------
+
     context_text = "\n\n".join(
         f"Page {item.get('page', 0)}:\n"
         f"{item.get('text', '')}"
         for item in context
     )
 
-    # Gemini prompt
+    # -----------------------------------------------------
+    # Grounded RAG prompt
+    # -----------------------------------------------------
+
     prompt = f"""
 You are an Agentic AI RAG chatbot.
 
@@ -154,7 +225,10 @@ USER QUESTION:
 Give only the final answer to the user's question.
 """
 
+    # -----------------------------------------------------
     # Gemini generation
+    # -----------------------------------------------------
+
     try:
 
         response = client.models.generate_content(
@@ -165,6 +239,7 @@ Give only the final answer to the user's question.
         answer = response.text.strip()
 
         if answer:
+
             return {
                 "answer": answer,
                 "score": best_score
@@ -175,12 +250,19 @@ Give only the final answer to the user's question.
         print(
             "\n================ GEMINI ERROR ================"
         )
-        print(repr(e))
+
+        print(
+            repr(e)
+        )
+
         print(
             "================================================\n"
         )
 
+    # -----------------------------------------------------
     # Gemini unavailable
+    # -----------------------------------------------------
+
     return {
         "answer": (
             "The answer-generation service is temporarily "
@@ -194,7 +276,12 @@ Give only the final answer to the user's question.
 # LANGGRAPH WORKFLOW
 # =========================================================
 
-graph_builder = StateGraph(AgentState)
+graph_builder = StateGraph(
+    AgentState
+)
+
+
+# Add nodes
 
 graph_builder.add_node(
     "retrieve",
@@ -206,19 +293,31 @@ graph_builder.add_node(
     generate
 )
 
+
+# START → RETRIEVE
+
 graph_builder.add_edge(
     START,
     "retrieve"
 )
+
+
+# RETRIEVE → GENERATE
 
 graph_builder.add_edge(
     "retrieve",
     "generate"
 )
 
+
+# GENERATE → END
+
 graph_builder.add_edge(
     "generate",
     END
 )
+
+
+# Compile LangGraph
 
 graph = graph_builder.compile()
